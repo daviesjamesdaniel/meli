@@ -94,7 +94,7 @@ impl ImapConnection {
         };
         let mut response = Vec::with_capacity(1024);
         let select_response = self
-            .select_mailbox(mailbox_hash, &mut response, true)
+            .select_mailbox(mailbox_hash, &mut response, false)
             .await?;
         if select_response.uidvalidity != cached_uidvalidity {
             self.uid_store
@@ -364,7 +364,7 @@ impl ImapConnection {
 
         // 1. check UIDVALIDITY. If fail, discard cache and rebuild
         let select_response = self
-            .select_mailbox(mailbox_hash, &mut response, true)
+            .select_mailbox(mailbox_hash, &mut response, false)
             .await?;
         if select_response.uidvalidity != cached_uidvalidity {
             self.uid_store
