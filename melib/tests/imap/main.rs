@@ -499,7 +499,7 @@ pub mod server {
                                 .unwrap();
                             tcp_stream.flush().await.unwrap();
                         }
-                        "UID SEARCH 1:*\r\n" => {
+                        "UID SEARCH 1:*\r\n" | "UID SEARCH ALL\r\n" => {
                             if !matches!(session_state, SessionState::SelectedMailbox) {
                                 tcp_stream.write_all(id.as_bytes()).await.unwrap();
                                 tcp_stream
@@ -520,12 +520,16 @@ pub mod server {
                                 tcp_stream.write_all(b"* SEARCH\r\n").await.unwrap();
                             } else {
                                 tcp_stream.write_all(b"* SEARCH ").await.unwrap();
-                                for uid in uids {
-                                    tcp_stream
-                                        .write_all(format!("{uid}").as_bytes())
-                                        .await
-                                        .unwrap();
-                                }
+                                tcp_stream
+                                    .write_all(
+                                        uids.iter()
+                                            .map(|u| u.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                            .as_bytes(),
+                                    )
+                                    .await
+                                    .unwrap();
                                 tcp_stream.write_all(b"\r\n").await.unwrap();
                             }
                             tcp_stream.write_all(id.as_bytes()).await.unwrap();
@@ -928,24 +932,30 @@ pub mod server {
         fn parse_sequence_set(set: &str) -> imap_types::sequence::SequenceSet {
             use imap_types::sequence::{SeqOrUid, Sequence, SequenceSet};
 
-            if set.contains(':') {
-                let [a, b]: [SeqOrUid; 2] = set
-                    .split(":")
-                    .map(|n| {
-                        if n == "*" {
-                            SeqOrUid::Asterisk
-                        } else {
-                            SeqOrUid::Value(n.parse::<u32>().unwrap().try_into().unwrap())
-                        }
-                    })
-                    .collect::<Vec<SeqOrUid>>()
-                    .try_into()
-                    .unwrap();
-                SequenceSet::try_from(vec![Sequence::Range(a, b)]).unwrap()
-            } else {
-                let item = set.parse::<u32>().unwrap().try_into().unwrap();
-                SequenceSet::try_from(vec![Sequence::Single(item)]).unwrap()
-            }
+            let sequences: Vec<Sequence> = set
+                .split(',')
+                .map(|part| {
+                    if part.contains(':') {
+                        let [a, b]: [SeqOrUid; 2] = part
+                            .split(":")
+                            .map(|n| {
+                                if n == "*" {
+                                    SeqOrUid::Asterisk
+                                } else {
+                                    SeqOrUid::Value(n.parse::<u32>().unwrap().try_into().unwrap())
+                                }
+                            })
+                            .collect::<Vec<SeqOrUid>>()
+                            .try_into()
+                            .unwrap();
+                        Sequence::Range(a, b)
+                    } else {
+                        let item = part.parse::<u32>().unwrap().try_into().unwrap();
+                        Sequence::Single(item)
+                    }
+                })
+                .collect();
+            SequenceSet::try_from(sequences).unwrap()
         }
     }
 }
