@@ -20,6 +20,8 @@
 //
 // SPDX-License-Identifier: EUPL-1.2 OR GPL-3.0-or-later
 
+use imap_codec::imap_types::search::SearchKey;
+
 use super::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -47,6 +49,8 @@ pub struct FetchState {
     pub batch_size: usize,
     pub cache_batch_size: usize,
     pub response: Vec<u8>,
+    pub real_uids: Option<Vec<UID>>,
+    pub real_uids_offset: usize,
 }
 
 impl FetchState {
@@ -235,7 +239,7 @@ impl FetchState {
                     self.stage = FetchStage::InitialFresh;
                     continue;
                 }
-                FetchStage::FreshFetch { max_uid } => {
+                FetchStage::FreshFetch { max_uid: _ } => {
                     let Self {
                         ref mut stage,
                         ref connection,
@@ -244,6 +248,8 @@ impl FetchState {
                         batch_size,
                         cache_batch_size: _,
                         ref mut response,
+                        ref mut real_uids,
+                        ref mut real_uids_offset,
                     } = self;
                     let mailbox_hash = *mailbox_hash;
                     let mut our_unseen: BTreeSet<EnvelopeHash> = BTreeSet::default();
@@ -261,20 +267,32 @@ impl FetchState {
                         return Ok(Vec::new());
                     }
                     let mut conn = connection.lock().await?;
-                    let mut max_uid_left = max_uid;
-
                     let mut envelopes = Vec::with_capacity(*batch_size);
                     conn.examine_mailbox(mailbox_hash, response, false).await?;
-                    if max_uid_left > 0 {
-                        let sequence_set = if max_uid_left == 1 {
-                            SequenceSet::from(ONE)
-                        } else {
-                            let min = max_uid_left.saturating_sub(*batch_size).max(1);
-                            let max = max_uid_left;
-                            max_uid_left = min.saturating_sub(1);
 
-                            SequenceSet::try_from(min..=max)?
-                        };
+                    if real_uids.is_none() {
+                        conn.send_command(CommandBody::search(None, SearchKey::All.into(), true))
+                            .await?;
+                        let mut search_response = Vec::with_capacity(8 * 1024);
+                        conn.read_response(&mut search_response, RequiredResponses::SEARCH)
+                            .await
+                            .chain_err_summary(|| {
+                                format!(
+                                    "Could not parse SEARCH response for mailbox {mailbox_path}"
+                                )
+                            })?;
+                        let (_, mut uids) = protocol_parser::search_results(&search_response)?;
+                        uids.sort_unstable_by(|a, b| b.cmp(a));
+                        *real_uids = Some(uids);
+                        *real_uids_offset = 0;
+                    }
+                    let all_uids = real_uids.as_ref().unwrap();
+                    let batch_end = (*real_uids_offset + *batch_size).min(all_uids.len());
+                    let batch = &all_uids[*real_uids_offset..batch_end];
+                    let is_last_batch = batch_end >= all_uids.len();
+
+                    if !batch.is_empty() {
+                        let sequence_set = SequenceSet::try_from(batch)?;
                         let (required_responses, macro_or_item_names) =
                             crate::imap::email::common_attributes();
                         conn.send_command(CommandBody::Fetch {
@@ -399,14 +417,11 @@ impl FetchState {
                         }
                         drop(conn);
                     }
-                    if max_uid_left <= 1 {
+                    *real_uids_offset = batch_end;
+                    if is_last_batch {
                         unseen.lock().unwrap().set_not_yet_seen(0);
                         mailbox_exists.lock().unwrap().set_not_yet_seen(0);
                         *stage = FetchStage::Finished;
-                    } else {
-                        *stage = FetchStage::FreshFetch {
-                            max_uid: max_uid_left,
-                        };
                     }
                     return Ok(envelopes);
                 }
@@ -458,6 +473,7 @@ impl FetchState {
             batch_size: _,
             cache_batch_size: _,
             ref mut response,
+            ..
         } = self;
         let mailbox_hash = *mailbox_hash;
         if !uid_store.keep_offline_cache.load(Ordering::SeqCst) {
