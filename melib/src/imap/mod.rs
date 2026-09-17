@@ -483,8 +483,8 @@ impl MailBackend for ImapType {
             batch_size: 2_500,
             cache_batch_size: 95_000,
             response: Vec::with_capacity(8 * 1024),
-            real_uids: None,
-            real_uids_offset: 0,
+            roundtrips: 0,
+            start_time: std::time::Instant::now(),
         };
 
         Ok(Box::pin(try_fn_stream(|emitter| async move {
@@ -518,6 +518,11 @@ impl MailBackend for ImapType {
                 })?;
                 emitter.emit(res).await;
                 if state.stage == FetchStage::Finished {
+                    log::trace!(
+                        "fetch finished roundtrips: {} elapsed: {:?}",
+                        state.roundtrips,
+                        state.start_time.elapsed()
+                    );
                     return Ok(());
                 }
             }

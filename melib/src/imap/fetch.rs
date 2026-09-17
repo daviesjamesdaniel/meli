@@ -20,11 +20,14 @@
 //
 // SPDX-License-Identifier: EUPL-1.2 OR GPL-3.0-or-later
 
-use imap_codec::imap_types::search::SearchKey;
+use imap_codec::imap_types::{
+    search::SearchKey,
+    sequence::{SequenceSet, ONE},
+};
 
 use super::*;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum FetchStage {
     #[default]
     InitialFresh,
@@ -36,6 +39,9 @@ pub enum FetchStage {
     ResyncCache,
     FreshFetch {
         max_uid: UID,
+        real_uids: Vec<UID>,
+        real_uids_offset: usize,
+        uid_strategy: bool,
     },
     Finished,
 }
@@ -49,49 +55,72 @@ pub struct FetchState {
     pub batch_size: usize,
     pub cache_batch_size: usize,
     pub response: Vec<u8>,
-    pub real_uids: Option<Vec<UID>>,
-    pub real_uids_offset: usize,
+    pub roundtrips: usize,
+    pub start_time: std::time::Instant,
 }
 
 impl FetchState {
     pub async fn chunk(&mut self) -> Result<Vec<Envelope>> {
         loop {
-            match self.stage {
+            let Self {
+                ref mut stage,
+                ref connection,
+                mailbox_hash,
+                ref mut uid_store,
+                batch_size,
+                cache_batch_size: _,
+                ref mut response,
+                ref mut roundtrips,
+                start_time: _,
+            } = self;
+            match stage {
                 FetchStage::InitialFresh => {
-                    let select_response = self
-                        .connection
-                        .lock()
-                        .await?
-                        .init_mailbox(self.mailbox_hash)
-                        .await?;
+                    let mut conn = connection.lock().await?;
+                    let select_response = conn.init_mailbox(*mailbox_hash).await?;
                     _ = self
                         .uid_store
-                        .update_mailbox(self.mailbox_hash, &select_response);
+                        .update_mailbox(*mailbox_hash, &select_response);
 
                     if select_response.exists == 0 {
                         self.stage = FetchStage::Finished;
                         return Ok(Vec::new());
                     }
+
+                    let uid_strategy = false;
+                    let real_uids = if uid_strategy {
+                        conn.send_command(CommandBody::search(None, SearchKey::All.into(), true))
+                            .await?;
+                        conn.read_response(response, RequiredResponses::SEARCH)
+                            .await?;
+                        *roundtrips += 1;
+                        let (_, mut uids) = protocol_parser::search_results(response)
+                            .chain_err_summary(|| "Could not parse SEARCH response")?;
+                        uids.sort_unstable_by(|a, b| b.cmp(a));
+                        uids
+                    } else {
+                        vec![]
+                    };
                     self.stage = FetchStage::FreshFetch {
                         max_uid: select_response.uidnext,
+                        real_uids,
+                        real_uids_offset: 0,
+                        uid_strategy,
                     };
                     continue;
                 }
                 FetchStage::InitialCache => {
-                    let select_response = self
-                        .connection
+                    let select_response = connection
                         .lock()
                         .await?
-                        .select_mailbox(self.mailbox_hash, &mut self.response, false)
+                        .select_mailbox(*mailbox_hash, response, false)
                         .await?;
-                    if let Err(err) = self
-                        .uid_store
-                        .update_mailbox(self.mailbox_hash, &select_response)
+                    if let Err(err) = uid_store
+                        .update_mailbox(*mailbox_hash, &select_response)
                         .chain_err_summary(|| {
-                            format!("Could not update cache for mailbox {}.", self.mailbox_hash)
+                            format!("Could not update cache for mailbox {}.", *mailbox_hash)
                         })
                     {
-                        (self.uid_store.event_consumer)(self.uid_store.account_hash, err.into());
+                        (uid_store.event_consumer)(uid_store.account_hash, err.into());
                     }
                     match self.lastseenuid() {
                         Ok(Some(max_uid)) => {
@@ -123,6 +152,8 @@ impl FetchState {
                     continue;
                 }
                 FetchStage::FromCache { max_uid, batch } => {
+                    let max_uid = *max_uid;
+                    let batch = *batch;
                     let cache_batch_size = if batch == 0 {
                         500
                     } else {
@@ -210,23 +241,18 @@ impl FetchState {
                     }
                 }
                 FetchStage::ResyncCache => {
-                    let mut conn = self.connection.lock().await?;
-                    let select_response = conn.init_mailbox(self.mailbox_hash).await?;
-                    match self
-                        .uid_store
-                        .update_mailbox(self.mailbox_hash, &select_response)
-                    {
+                    let mut conn = connection.lock().await?;
+                    let select_response = conn.init_mailbox(*mailbox_hash).await?;
+                    match uid_store.update_mailbox(*mailbox_hash, &select_response) {
                         Err(err) if err.kind.is_not_found() => {
-                            _ = self
-                                .uid_store
-                                .init_mailbox(self.mailbox_hash, &select_response);
+                            _ = self.uid_store.init_mailbox(*mailbox_hash, &select_response);
                         }
                         Err(err) => {
-                            (self.uid_store.event_consumer)(
-                                self.uid_store.account_hash,
+                            (uid_store.event_consumer)(
+                                uid_store.account_hash,
                                 err.set_summary(format!(
                                     "Could not update cache for mailbox {}.",
-                                    self.mailbox_hash
+                                    mailbox_hash
                                 ))
                                 .into(),
                             );
@@ -239,18 +265,12 @@ impl FetchState {
                     self.stage = FetchStage::InitialFresh;
                     continue;
                 }
-                FetchStage::FreshFetch { max_uid: _ } => {
-                    let Self {
-                        ref mut stage,
-                        ref connection,
-                        mailbox_hash,
-                        ref uid_store,
-                        batch_size,
-                        cache_batch_size: _,
-                        ref mut response,
-                        ref mut real_uids,
-                        ref mut real_uids_offset,
-                    } = self;
+                FetchStage::FreshFetch {
+                    max_uid: _,
+                    ref real_uids,
+                    ref mut real_uids_offset,
+                    uid_strategy: true,
+                } => {
                     let mailbox_hash = *mailbox_hash;
                     let mut our_unseen: BTreeSet<EnvelopeHash> = BTreeSet::default();
                     let (mailbox_path, mailbox_exists, no_select, unseen) = {
@@ -270,28 +290,12 @@ impl FetchState {
                     let mut envelopes = Vec::with_capacity(*batch_size);
                     conn.examine_mailbox(mailbox_hash, response, false).await?;
 
-                    if real_uids.is_none() {
-                        conn.send_command(CommandBody::search(None, SearchKey::All.into(), true))
-                            .await?;
-                        let mut search_response = Vec::with_capacity(8 * 1024);
-                        conn.read_response(&mut search_response, RequiredResponses::SEARCH)
-                            .await
-                            .chain_err_summary(|| {
-                                format!(
-                                    "Could not parse SEARCH response for mailbox {mailbox_path}"
-                                )
-                            })?;
-                        let (_, mut uids) = protocol_parser::search_results(&search_response)?;
-                        uids.sort_unstable_by(|a, b| b.cmp(a));
-                        *real_uids = Some(uids);
-                        *real_uids_offset = 0;
-                    }
-                    let all_uids = real_uids.as_ref().unwrap();
-                    let batch_end = (*real_uids_offset + *batch_size).min(all_uids.len());
-                    let batch = &all_uids[*real_uids_offset..batch_end];
-                    let is_last_batch = batch_end >= all_uids.len();
+                    let batch_end = (*real_uids_offset + *batch_size).min(real_uids.len());
+                    let batch = &real_uids[*real_uids_offset..batch_end];
+                    let is_last_batch = batch_end >= real_uids.len();
 
                     if !batch.is_empty() {
+                        let batch_start_time = std::time::Instant::now();
                         let sequence_set = SequenceSet::try_from(batch)?;
                         let (required_responses, macro_or_item_names) =
                             crate::imap::email::common_attributes();
@@ -307,6 +311,7 @@ impl FetchState {
                             .chain_err_summary(|| {
                                 format!("Could not parse fetch response for mailbox {mailbox_path}")
                             })?;
+                        *roundtrips += 1;
                         let (_, mut v, _) = protocol_parser::fetch_responses(response)?;
                         for FetchResponse {
                             ref uid,
@@ -365,7 +370,7 @@ impl FetchState {
                             }
                         }
                         {
-                            let mut uid_store = Arc::clone(&self.uid_store);
+                            let mut uid_store = Arc::clone(uid_store);
 
                             if let Err(err) = uid_store
                                 .insert_envelopes(mailbox_hash, &v)
@@ -415,13 +420,199 @@ impl FetchState {
                         if recreate_msn {
                             conn.create_uid_msn_cache(mailbox_hash).await?;
                         }
+                        log::trace!(
+                            "fetch finished batch uid_strategy=true {roundtrips} \
+                             recreated_msn={recreate_msn:?} elapsed: {:?}",
+                            batch_start_time.elapsed()
+                        );
                         drop(conn);
                     }
                     *real_uids_offset = batch_end;
                     if is_last_batch {
                         unseen.lock().unwrap().set_not_yet_seen(0);
                         mailbox_exists.lock().unwrap().set_not_yet_seen(0);
-                        *stage = FetchStage::Finished;
+                        self.stage = FetchStage::Finished;
+                    }
+                    return Ok(envelopes);
+                }
+                FetchStage::FreshFetch {
+                    max_uid,
+                    real_uids: _,
+                    real_uids_offset: _,
+                    uid_strategy: false,
+                } => {
+                    let mailbox_hash = *mailbox_hash;
+                    let mut our_unseen: BTreeSet<EnvelopeHash> = BTreeSet::default();
+                    let (mailbox_path, mailbox_exists, no_select, unseen) = {
+                        let f = &uid_store.mailboxes.lock().await[&mailbox_hash];
+                        (
+                            f.imap_path().to_string(),
+                            Arc::clone(&f.exists),
+                            f.no_select,
+                            Arc::clone(&f.unseen),
+                        )
+                    };
+                    if no_select {
+                        self.stage = FetchStage::Finished;
+                        return Ok(Vec::new());
+                    }
+                    let mut conn = connection.lock().await?;
+                    let mut envelopes = Vec::with_capacity(*batch_size);
+                    conn.examine_mailbox(mailbox_hash, response, false).await?;
+
+                    let mut max_uid_left = *max_uid;
+
+                    if max_uid_left > 0 {
+                        let sequence_set = if max_uid_left == 1 {
+                            SequenceSet::from(ONE)
+                        } else {
+                            let min = max_uid_left.saturating_sub(*batch_size).max(1);
+                            let max = max_uid_left;
+                            max_uid_left = min.saturating_sub(1);
+                            SequenceSet::try_from(min..=max)?
+                        };
+                        let batch_start_time = std::time::Instant::now();
+                        let (required_responses, macro_or_item_names) =
+                            crate::imap::email::common_attributes();
+                        conn.send_command(CommandBody::Fetch {
+                            sequence_set,
+                            macro_or_item_names,
+                            uid: true,
+                            modifiers: vec![],
+                        })
+                        .await?;
+                        conn.read_response(response, required_responses)
+                            .await
+                            .chain_err_summary(|| {
+                                format!("Could not parse fetch response for mailbox {mailbox_path}")
+                            })?;
+                        *roundtrips += 1;
+                        let (_, mut v, _) = protocol_parser::fetch_responses(response)?;
+                        for FetchResponse {
+                            ref uid,
+                            ref mut envelope,
+                            ref mut flags,
+                            raw_fetch_value,
+                            ref references,
+                            ..
+                        } in v.iter_mut()
+                        {
+                            if uid.is_none() || envelope.is_none() || flags.is_none() {
+                                imap_log!(
+                                    trace,
+                                    conn,
+                                    "BUG? something in fetch is none. UID: {:?}, envelope: {:?} \
+                                     flags: {:?}",
+                                    uid,
+                                    envelope,
+                                    flags
+                                );
+                                imap_log!(
+                                    trace,
+                                    conn,
+                                    "response was: {}",
+                                    String::from_utf8_lossy(response)
+                                );
+                                if let Ok(Some(untagged_response)) =
+                                    super::protocol_parser::untagged_responses(raw_fetch_value)
+                                        .map(|(_, v, _)| v)
+                                {
+                                    if let Some(ev) =
+                                        conn.process_untagged(untagged_response).await?
+                                    {
+                                        conn.add_backend_event(ev);
+                                    }
+                                }
+                                continue;
+                            }
+                            let uid = uid.unwrap();
+                            let env = envelope.as_mut().unwrap();
+                            env.set_hash(generate_envelope_hash(&mailbox_path, &uid));
+                            if let Some(value) = references {
+                                env.set_references(value);
+                            }
+                            let mut tag_lck = uid_store.collection.tag_index.write().unwrap();
+                            if let Some((flags, keywords)) = flags {
+                                env.set_flags(*flags);
+                                if !env.is_seen() {
+                                    our_unseen.insert(env.hash());
+                                }
+                                for f in keywords {
+                                    let hash = TagHash::from_bytes(f.as_bytes());
+                                    tag_lck.entry(hash).or_insert_with(|| f.to_string());
+                                    env.tags_mut().insert(hash);
+                                }
+                            }
+                        }
+                        {
+                            let mut uid_store = Arc::clone(uid_store);
+
+                            if let Err(err) = uid_store
+                                .insert_envelopes(mailbox_hash, &v)
+                                .chain_err_summary(|| {
+                                    format!(
+                                        "Could not save envelopes in cache for mailbox \
+                                         {mailbox_path}"
+                                    )
+                                })
+                            {
+                                (uid_store.event_consumer)(uid_store.account_hash, err.into());
+                            }
+                        }
+
+                        let mut recreate_msn = false;
+                        for f in v {
+                            let FetchResponse {
+                                uid: Some(uid),
+                                message_sequence_number,
+                                envelope: Some(env),
+                                ..
+                            } = f
+                            else {
+                                continue;
+                            };
+                            recreate_msn |= !conn
+                                .msn_index
+                                .entry(mailbox_hash)
+                                .or_default()
+                                .insert(message_sequence_number, uid);
+                            uid_store
+                                .hash_index
+                                .lock()
+                                .unwrap()
+                                .insert(env.hash(), (uid, mailbox_hash));
+                            uid_store
+                                .uid_index
+                                .lock()
+                                .unwrap()
+                                .insert((mailbox_hash, uid), env.hash());
+                            envelopes.push(env);
+                        }
+                        unseen.lock().unwrap().insert_existing_set(our_unseen);
+                        mailbox_exists.lock().unwrap().insert_existing_set(
+                            envelopes.iter().map(|env| env.hash()).collect::<_>(),
+                        );
+                        if recreate_msn {
+                            conn.create_uid_msn_cache(mailbox_hash).await?;
+                        }
+                        log::trace!(
+                            "fetch finished batch uid_strategy=false {roundtrips} \
+                             recreated_msn={recreate_msn:?} elapsed: {:?}",
+                            batch_start_time.elapsed()
+                        );
+                        drop(conn);
+                    }
+                    if max_uid_left <= 1 {
+                        unseen.lock().unwrap().set_not_yet_seen(0);
+                        mailbox_exists.lock().unwrap().set_not_yet_seen(0);
+                        self.stage = FetchStage::Finished;
+                    } else {
+                        *stage = FetchStage::FreshFetch {
+                            max_uid: max_uid_left,
+                            real_uids: vec![],
+                            real_uids_offset: 0,
+                            uid_strategy: false,
+                        };
                     }
                     return Ok(envelopes);
                 }
